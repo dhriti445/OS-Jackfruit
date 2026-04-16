@@ -5,8 +5,8 @@ A lightweight Linux container runtime in C with a long-running parent supervisor
 ## Team Information
 | Name | SRN |
 |------|-----|
-| Deana Naveen A | PES1UG24AM077 |
-| Bhoomika Kshatriya | PES1UG24AM068 |
+| DHRITI KAMANI | PES1UG24AM085 |
+| DIYA AGARWAL | PES1UG24AM096 |
 ---
 ## Build, Load, and Run Instructions
 ### 1. Install Dependencies
@@ -74,7 +74,8 @@ make -C boilerplate ci
 ```
 ---
 ## Demo Screenshots
-
+### 1 — Multi-container supervision
+**Caption:** Two containers (alpha and beta) running concurrently under one supervisor process.
 <img width="792" height="1599" alt="image" src="https://github.com/user-attachments/assets/602f31f4-ec55-4bfe-9ffa-2e7fd79f4e9d" />
 
 <img width="940" height="379" alt="image" src="https://github.com/user-attachments/assets/22c5a36e-ef08-4a30-b128-1a224caf507f" />
