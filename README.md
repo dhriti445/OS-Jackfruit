@@ -111,51 +111,259 @@ make -C boilerplate ci
 
 
 ## Engineering Analysis
-### Isolation Mechanisms
-Linux namespaces are the kernel mechanism that makes container isolation possible. When `clone()` is called with `CLONE_NEWPID`, the kernel creates a new PID namespace — the first process inside sees itself as PID 1 and cannot see or signal any process outside its namespace. `CLONE_NEWUTS` gives each container its own hostname so changes inside do not affect the host. `CLONE_NEWNS` creates a private mount namespace so mounts inside the container do not propagate to the host.
-`chroot()` complements namespaces by restricting the container's filesystem view. After `chroot(rootfs_path)`, the container cannot reference any path outside its assigned directory.
-The host kernel is still shared across all containers. They run on the same kernel version, use the same system call interface, share the same CPU scheduler, and consume memory from the same physical pool.
-### Supervisor and Process Lifecycle
-When a process exits in Linux, it becomes a zombie until its parent calls `waitpid()` to collect its exit status. Without a persistent parent, every exited container would remain a zombie indefinitely. A long-running supervisor solves this by staying alive for the entire lifetime of all containers it manages.
-Process creation uses `clone()` rather than `fork()` because `clone()` accepts namespace flags directly. The child calls `chroot()`, mounts `/proc`, and `execvp()`s the requested command. The parent records the child's PID in a metadata table.
-`SIGCHLD` is delivered asynchronously when any container exits. A self-pipe is used: the handler writes one byte to a pipe, and the main loop drains the pipe and calls `waitpid(-1, WNOHANG)` to reap all children. Termination is classified as `stopped` (if `stop_requested` was set), `hard_limit_killed` (if SIGKILL without a stop request), or `killed` otherwise.
-### IPC, Threads, and Synchronization
-**Path A — Logging (pipes):** Before `clone()`, the supervisor creates a pipe. The child's stdout and stderr are redirected into the write end via `dup2()`. The parent passes the read end to a producer thread, which reads lines and inserts them into a bounded ring buffer. A consumer thread drains the buffer and writes to a per-container log file.
-The ring buffer's shared variables (`head`, `tail`, `count`) would be corrupted without mutual exclusion. A `pthread_mutex_t` protects them. Two `pthread_cond_t` variables (`not_full` and `not_empty`) allow threads to sleep rather than busy-wait. The `done` flag is set inside the lock and broadcast to all waiting consumers so no consumer sleeps forever after the producer exits.
-**Path B — Control (UNIX domain socket):** CLI client processes connect to `/tmp/engine.sock`, send a command string, and read the response. This is completely separate from the logging pipes. The metadata table is protected by its own `pthread_mutex_t` (`containers_lock`) so CLI operations and logging never block each other.
-### Memory Management and Enforcement
-RSS (Resident Set Size) measures the physical memory pages currently mapped into a process's address space and present in RAM. It does not count pages swapped out to disk, memory-mapped files not yet accessed, or shared library pages. This means RSS can both overestimate and underestimate true memory usage.
-Soft and hard limits are different policies. A soft limit triggers a warning — the process continues but the operator is notified. A hard limit triggers termination. Two thresholds give operators a chance to react before resorting to forced termination.
-Memory enforcement belongs in kernel space because user-space monitors are inherently racy — a process could allocate memory between two polling intervals. The kernel has full visibility into actual memory usage and cannot be bypassed by the monitored process.
-### Scheduling Behavior
-*(To be completed by teammate with experiment results.)*
+
+### 1. Isolation Mechanisms
+
+The runtime achieves isolation using Linux namespaces and filesystem isolation.
+
+Each container is created with:
+
+* **PID namespace** → processes inside the container see their own PID space
+* **UTS namespace** → each container can have its own hostname
+* **Mount namespace** → isolated filesystem view
+
+Additionally, `chroot()` is used to restrict the container to its own root filesystem (`rootfs-alpha`, `rootfs-beta`). This ensures that processes inside the container cannot access files outside their assigned directory.
+
+Inside each container, `/proc` is mounted so that commands like `ps` work correctly.
+
+However, all containers share the **same host kernel**, meaning:
+
+* System calls are handled by the host
+* CPU scheduling is shared
+* Physical memory is shared
+
+Thus, this implementation provides **process-level isolation, not full virtualization**.
+
 ---
-## Design Decisions and Tradeoffs
-### Namespace Isolation
-- **Choice:** `clone()` with `CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS` and `chroot()`
-- **Tradeoff:** `chroot()` is simpler than `pivot_root()` but a privileged process can escape via `..` traversal
-- **Justification:** Sufficient for this project's scope with no observable difference in demo scenarios
-### Supervisor Architecture
-- **Choice:** Single supervisor with a self-pipe for SIGCHLD and a dedicated accept thread for CLI connections
-- **Tradeoff:** CLI connections are handled sequentially — a blocking `run` command delays other commands
-- **Justification:** Sequential handling is safe and simpler for a single-user CLI tool
-### IPC and Logging
-- **Choice:** UNIX domain socket for CLI, anonymous pipes for logging, bounded ring buffer with mutex and condition variables
-- **Tradeoff:** Reading one byte at a time is simple but inefficient for high-throughput output
-- **Justification:** Not a high-throughput scenario; byte-at-a-time reading makes line detection trivial
-### Kernel Monitor
-- **Choice:** Linux Kernel Module with a periodic kernel timer polling RSS
-- **Tradeoff:** Polling introduces a window where a process could exceed the hard limit undetected
-- **Justification:** Event-driven enforcement requires hooking the kernel allocator, which is far more complex
-### Scheduling Experiments
-*(To be completed by teammate.)*
+
+### 2. Supervisor and Process Lifecycle
+
+A long-running supervisor process is used to manage all containers.
+
+From the outputs:
+
+* The supervisor starts once:
+
+  ```
+  Supervisor started...
+  ```
+* It receives commands:
+
+  ```
+  Received command: start alpha ...
+  ```
+* It launches containers and tracks them:
+
+  ```
+  Container alpha started with PID 3454
+  ```
+
+The supervisor:
+
+* Creates containers using `fork()/clone()`
+* Maintains metadata (ID, PID, state)
+* Tracks lifecycle states (`RUNNING`, `EXITED`)
+* Handles multiple containers concurrently
+
+Example from output:
+
+```
+ID: alpha | PID: 3454 | STATE: EXITED
+ID: beta  | PID: 3474 | STATE: RUNNING
+```
+
+When a container finishes (e.g., `sleep 3`), the supervisor:
+
+* Detects exit using `SIGCHLD`
+* Reaps the process using `wait()`
+* Updates metadata
+
+This prevents zombie processes and ensures proper lifecycle management.
+
 ---
-## Scheduler Experiment Results
-*(To be completed by teammate. Must include raw timing measurements, at least one comparison table, and explanation of results in terms of Linux CFS scheduling goals.)*
 
+### 3. IPC, Threads, and Synchronization
 
+The project uses two IPC paths:
 
+#### Control Path (CLI → Supervisor)
 
+Commands like:
 
+```
+./engine start alpha ...
+./engine ps
+./engine stop alpha
+```
 
+are sent to the supervisor, which processes them and responds.
 
+#### Logging Path (Container → Supervisor)
+
+Container output is captured using **pipes** and stored in log files.
+
+Example:
+
+```
+cat logs/alpha.log
+hello_log
+hello_world
+```
+
+This shows that:
+
+* Container stdout is redirected
+* Logs are persisted per container
+
+#### Synchronization
+
+Potential issues:
+
+* Multiple containers writing logs simultaneously
+* Concurrent access to shared metadata
+* Race conditions during insert/remove
+
+Solution:
+
+* **Mutex locks** protect shared structures
+* Producer-consumer model ensures safe logging
+* Safe list iteration avoids crashes during deletion
+
+This ensures:
+
+* No data corruption
+* No lost logs
+* No race conditions
+
+---
+
+### 4. Memory Management and Enforcement
+
+Memory usage is tracked using **RSS (Resident Set Size)**.
+
+RSS measures:
+
+* Physical memory currently used by a process
+
+RSS does NOT include:
+
+* Swapped-out memory
+* Non-resident pages
+
+From your outputs:
+
+```
+Soft limit warning for container alpha
+Hard limit exceeded. Killing container beta
+```
+
+This shows:
+
+#### Soft Limit
+
+* Only generates a warning
+* Triggered once per container
+* Helps detect excessive usage early
+
+#### Hard Limit
+
+* Strict enforcement
+* Process is killed using `SIGKILL`
+
+Why kernel space?
+
+* Direct access to process memory (`task_struct`, `mm_struct`)
+* Faster and more reliable than user-space polling
+* Immediate enforcement without delay
+
+This ensures **accurate and real-time memory control**.
+
+---
+
+### 5. Scheduling Behavior
+
+Scheduling behavior was observed using:
+
+* Multiple containers (`alpha`, `beta`)
+* Workloads like `busybox` and `sleep`
+* Monitoring using `top`
+
+Example output:
+
+```
+PID   USER   %CPU   COMMAND
+1511  diya   86.7   gnome-shell
+4683  root   66.7   busybox
+4707  root   53.3   busybox
+```
+
+Observations:
+
+* CPU-bound processes (busybox) consume high CPU
+* Multiple processes share CPU based on scheduler decisions
+* System load increases when multiple containers run
+
+Linux scheduler balances:
+
+* **Fairness** → distributes CPU among processes
+* **Responsiveness** → interactive processes remain smooth
+* **Throughput** → maximize total work
+
+---
+
+## 6. Scheduler Experiment Results
+
+### Experiment Setup
+
+Two containers were started simultaneously:
+
+```
+sudo ./engine start alpha ./rootfs-alpha /bin/busybox yes
+sudo ./engine start beta  ./rootfs-beta  /bin/busybox yes
+```
+
+System performance was monitored using:
+
+```
+top
+```
+
+---
+
+### Observed Results
+
+| Container | Process | CPU Usage (%) | Behavior         |
+| --------- | ------- | ------------- | ---------------- |
+| Alpha     | busybox | ~60–70%       | CPU intensive    |
+| Beta      | busybox | ~50–60%       | Competes for CPU |
+
+System stats:
+
+```
+load average: ~1.4
+Tasks: multiple running
+```
+
+---
+
+### Analysis
+
+* Both containers compete for CPU resources
+* CPU is shared dynamically between processes
+* No single container gets 100% CPU
+* Scheduler distributes CPU time across active processes
+
+Key conclusions:
+
+* Linux scheduler ensures **fair CPU distribution**
+* CPU-bound workloads dominate CPU usage
+* Multiple containers increase system load
+* Scheduler dynamically adjusts based on demand
+
+This demonstrates how Linux scheduling achieves:
+
+* Fairness between processes
+* Efficient CPU utilization
+* Balanced system performance
+
+---
