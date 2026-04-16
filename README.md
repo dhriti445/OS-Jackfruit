@@ -88,7 +88,7 @@ make -C boilerplate ci
 <img width="940" height="464" alt="image" src="https://github.com/user-attachments/assets/8a18f8c9-d8ba-4605-b0e9-dd3e7e603995" />
 
 ### 4 — CLI and IPC
-**Caption:** CLI terminal issuing `engine start` with flags; supervisor terminal showing `[supervisor] received command: start` and responding with `OK:` over the UNIX domain socket.
+**Caption:** CLI terminal issuing `engine start` with flags; supervisor terminal showing `[supervisor] received command: start` and responding with `OK:` over the UNIX domain socket.<br>
 <img width="487" height="75" alt="image" src="https://github.com/user-attachments/assets/3ec72e50-75df-4afc-bd4e-ef10eba1e835" />
 <img width="1408" height="179" alt="image" src="https://github.com/user-attachments/assets/2f8cfc26-54b3-4ce9-a679-5d6b7a740c3b" />
 
